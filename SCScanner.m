@@ -13,11 +13,22 @@
  * not every backend notices a USB scanner plugged in after sane_init; with
  * one open, sane_get_devices alone (backends using sanei_usb rescan the
  * bus there).
+ *
+ * USB scanners: SANE opens them through libusb, on device nodes devfs
+ * makes root's. When SANE lists nothing and a USB device is connected
+ * that no kernel driver has and Scanner can't open, or sane_open is
+ * refused for one, Scanner asks SettingsHelper for that device (UsbGrant,
+ * an administrator's right) and looks again.
  */
 
 #import <AppKit/AppKit.h>
 #import "SCScanner.h"
+#import "SCHelperClient.h"
+#import "settingshelper_types.h"
 
+#include <dirent.h>
+#include <stdio.h>
+#include <unistd.h>
 #include <sane/sane.h>
 #include <sane/saneopts.h>
 #include <stdlib.h>
@@ -370,6 +381,81 @@ SCTo8Bit (const unsigned char *src, int depth, int bpl, int samplesPerLine,
     }
 }
 
+/* ---- USB devices Scanner can't open ------------------------------------- */
+
+/* "bus.address" of every USB device some kernel driver has (an interface
+ * of it, or a hub): its %location names it, ugen=ugen<bus>.<address>. */
+static NSSet *
+SCClaimedUSB (void)
+{
+  NSMutableSet *claimed = [NSMutableSet set];
+  FILE *f = popen ("/sbin/sysctl dev 2>/dev/null", "r");
+  char line[1024], *u;
+
+  if (f == NULL)
+    return claimed;
+  while (fgets (line, sizeof line, f) != NULL)
+    if (strstr (line, ".%location:") != NULL
+        && (u = strstr (line, "ugen=ugen")) != NULL)
+      {
+        unsigned bus, address;
+        if (sscanf (u, "ugen=ugen%u.%u", &bus, &address) == 2)
+          [claimed addObject:[NSString stringWithFormat:@"%u.%u", bus, address]];
+      }
+  pclose (f);
+  return claimed;
+}
+
+/* The USB devices no kernel driver has that this process can't open:
+ * what SettingsHelper may grant. Root hubs (address 1) aren't asked. */
+static NSArray *
+SCUnopenableUSB (void)
+{
+  NSMutableArray *out = [NSMutableArray array];
+  NSSet *claimed = nil;
+  DIR *d = opendir ("/dev/usb");
+  struct dirent *e;
+
+  if (d == NULL)
+    return out;
+  while ((e = readdir (d)) != NULL)
+    {
+      unsigned bus, address, ep;
+      char path[64];
+      NSString *name;
+
+      if (sscanf (e->d_name, "%u.%u.%u", &bus, &address, &ep) != 3
+          || ep != 0 || address <= 1)
+        continue;
+      snprintf (path, sizeof path, "/dev/usb/%s", e->d_name);
+      if (access (path, R_OK | W_OK) == 0)
+        continue;
+      if (claimed == nil)
+        claimed = SCClaimedUSB ();
+      name = [NSString stringWithFormat:@"%u.%u", bus, address];
+      if (![claimed containsObject:name])
+        [out addObject:name];
+    }
+  closedir (d);
+  return out;
+}
+
+/* bus and address from a SANE name "backend:libusb:BBB:DDD". */
+static BOOL
+SCUSBAddress (NSString *saneName, int *bus, int *address)
+{
+  NSRange r = [saneName rangeOfString:@"libusb:"];
+  unsigned b, a;
+
+  if (r.location == NSNotFound
+      || sscanf ([[saneName substringFromIndex:NSMaxRange (r)] UTF8String],
+                 "%u:%u", &b, &a) != 2)
+    return NO;
+  *bus = b;
+  *address = a;
+  return YES;
+}
+
 /* ---- the scanner -------------------------------------------------------- */
 
 @implementation SCScanner
@@ -569,28 +655,86 @@ SCSystemNetConf (NSString *userDir)
   initialised = NO;
 }
 
+/* What SANE lists now. */
+- (NSMutableArray *)listed
+{
+  const SANE_Device **list = NULL;
+  NSMutableArray *found = [NSMutableArray array];
+  int i;
+
+  if (initialised && sane_get_devices (&list, SANE_FALSE)
+                         == SANE_STATUS_GOOD && list != NULL)
+    for (i = 0; list[i] != NULL; i++)
+      [found addObject:
+               [SCDevice deviceWithSANEName:
+                           [NSString stringWithUTF8String:list[i]->name]
+                                     vendor:list[i]->vendor
+                   ? [NSString stringWithUTF8String:list[i]->vendor] : @""
+                                      model:list[i]->model
+                   ? [NSString stringWithUTF8String:list[i]->model] : @""]];
+  return found;
+}
+
+/* Ask SettingsHelper once for each USB device Scanner can't open; YES if
+ * one was given. A refusal for want of the right sets needsAdmin, until
+ * the devices asked about are gone. */
+- (BOOL)askForUSB
+{
+  NSArray *candidates = SCUnopenableUSB ();
+  NSEnumerator *e;
+  NSString *name;
+  BOOL granted = NO;
+
+  if (usbAsked == nil)
+    usbAsked = [[NSMutableSet alloc] init];
+  /* Unplugged: forget it (a device plugged in later is asked about). */
+  e = [[usbAsked allObjects] objectEnumerator];
+  while ((name = [e nextObject]) != nil)
+    if (![candidates containsObject:name])
+      [usbAsked removeObject:name];
+  if ([usbAsked count] == 0)
+    needsAdmin = NO;
+  e = [candidates objectEnumerator];
+  while ((name = [e nextObject]) != nil)
+    {
+      unsigned bus, address;
+      int status;
+
+      if ([usbAsked containsObject:name]
+          || sscanf ([name UTF8String], "%u.%u", &bus, &address) != 2)
+        continue;
+      [usbAsked addObject:name];
+      status = SCHelperUSBGrant (bus, address);
+      NSLog (@"Scanner: asked SettingsHelper for USB device %@: %d", name,
+             status);
+      if (status == SH_OK)
+        granted = YES;
+      else if (status == SH_ERR_DENIED || status == SH_ERR_NOT_CONSOLE
+               || status == SH_ERR_AUTH_NEEDED)
+        needsAdmin = YES;
+    }
+  return granted;
+}
+
 - (void)search:(NSTimer *)timer
 {
   @autoreleasepool
     {
-      const SANE_Device **list = NULL;
-      NSMutableArray *found = [NSMutableArray array];
-      BOOL first = !searched;
+      NSMutableArray *found;
+      BOOL first = !searched, wasNeedingAdmin = needsAdmin;
       int i;
 
       if (handle == NULL)
         [self saneStop];
       [self saneStart];
-      if (initialised && sane_get_devices (&list, SANE_FALSE)
-                             == SANE_STATUS_GOOD && list != NULL)
-        for (i = 0; list[i] != NULL; i++)
-          [found addObject:
-                   [SCDevice deviceWithSANEName:
-                               [NSString stringWithUTF8String:list[i]->name]
-                                         vendor:list[i]->vendor
-                       ? [NSString stringWithUTF8String:list[i]->vendor] : @""
-                                          model:list[i]->model
-                       ? [NSString stringWithUTF8String:list[i]->model] : @""]];
+      found = [self listed];
+      /* Nothing usable: perhaps a USB scanner Scanner may not open yet. */
+      if ([found count] == 0 && handle == NULL && [self askForUSB])
+        {
+          [self saneStop];
+          [self saneStart];
+          found = [self listed];
+        }
       /* The one open stays listed even if a backend leaves it out while
        * it is in use. */
       if (handle != NULL && openName != nil)
@@ -610,14 +754,17 @@ SCSystemNetConf (NSString *userDir)
               }
         }
       searched = YES;
-      if (first || ![found isEqualToArray:devices])
+      if (first || ![found isEqualToArray:devices]
+          || wasNeedingAdmin != needsAdmin)
         {
           ASSIGN (devices, found);
           [self tell:@selector (scannerDevicesChanged:)
                 with:[NSDictionary dictionaryWithObjectsAndKeys:
                                      found, @"devices",
                                      [NSNumber numberWithBool:YES],
-                                     @"searched", nil]];
+                                     @"searched",
+                                     [NSNumber numberWithBool:needsAdmin],
+                                     @"needsAdmin", nil]];
         }
     }
 }
@@ -656,15 +803,29 @@ SCSystemNetConf (NSString *userDir)
         [info setObject:device forKey:SCDeviceKey];
       [self saneStart];
       status = sane_open ([name UTF8String], (SANE_Handle *)&handle);
+      if (status == SANE_STATUS_ACCESS_DENIED)
+        {
+          /* A USB scanner whose nodes are root's: ask for it, and try
+           * again once. */
+          int bus, address, granted = -1;
+
+          if (SCUSBAddress (name, &bus, &address))
+            {
+              granted = SCHelperUSBGrant (bus, address);
+              NSLog (@"Scanner: asked SettingsHelper for USB device %d.%d: %d",
+                     bus, address, granted);
+            }
+          if (granted == SH_OK)
+            status = sane_open ([name UTF8String], (SANE_Handle *)&handle);
+        }
       if (status != SANE_STATUS_GOOD)
         {
           handle = NULL;
           [info setObject:status == SANE_STATUS_ACCESS_DENIED
                 ? [NSString stringWithFormat:
-                     @"Scanner isn't allowed to use %@. If it is connected "
-                     @"with USB, the person at the screen is given USB "
-                     @"scanners when they log in; try logging out and in "
-                     @"again.", device ? [device title] : name]
+                     @"An administrator needs to allow USB scanners "
+                     @"before Scanner can use %@.",
+                     device ? [device title] : name]
                 : [NSString stringWithFormat:@"Scanner couldn't open %@: %s.",
                               device ? [device title] : name,
                               sane_strstatus (status)]

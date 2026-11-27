@@ -1,0 +1,626 @@
+/*
+ * Copyright (c) 2026, Joseph Maloney
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * settingshelper.defs — Mach RPC interface to SettingsHelper, the settings
+ * apps' privileged helper (nextbsd/nextbsd#628, the Settings apps design's
+ * "privileged helper" section).
+ *
+ * SettingsHelper runs as root under launchd as org.nextbsd.SettingsHelper.
+ * It makes the root-only settings changes, and only through TYPED
+ * operations: never a shell command, never a path to write, never a
+ * free-form property list.
+ *
+ * Every routine carries the sender's audit token (ServerAuditToken). The
+ * helper answers only root and processes in the console user's session
+ * (loginwindow's session record, /var/run/loginwindow/<uid>.session).
+ *
+ * The routines come in two kinds:
+ *
+ *   rights      sh_right_info, sh_authorize, sh_deauthorize: what a right's
+ *               rule asks for, proving it (PAM service "authorization"),
+ *               and dropping the session's credentials (the lock closed).
+ *   operations  one per change, each needing a right
+ *               "org.nextbsd.settings.<area>" (SettingsRights.plist).
+ *               Each takes an SHAuthForm, all zeroes for now; see
+ *               settingshelper_types.h.
+ *
+ * ADDING AN OPERATION: append the routine at the END. A routine's Mach
+ * message id is its position in the subsystem, so existing ids never
+ * move and an older client keeps working with a newer helper. The
+ * operations the settings apps will need, in the order they are expected:
+ * SetTimeZone, SetDate, SetNetworkTime, SetSystemLocale,
+ * CommitNetworkPreferences, SetComputerName, SetSoundOutput, CreateUser,
+ * DeleteUser, SetPassword, SetAdmin, SetAutoLogin, SetLoginWindowOptions,
+ * SetWindowServerSystemSettings, CUPSAdmin. Each one's app ticket adds it.
+ * Update.app's operations (32017-32022) start jobs that outlast the
+ * call; see their section at the end.
+ *
+ * Subsystem base 32000: configd and ipconfigd use 20000, wland 30000,
+ * bluetoothd 31000.
+ *
+ * Installer.app's operations (nextbsd/nextbsd#670) start at 32030, after
+ * the `skip`s that keep 32017-32029 for Update.app's, so the two can land
+ * in either order.
+ */
+
+#include <mach/std_types.defs>
+#include <mach/mach_types.defs>
+
+subsystem settingshelper 32000;
+serverprefix _;
+
+import "settingshelper_types.h";
+
+type sh_right		= array[128] of char ctype: SHRightName;
+type sh_user		= array[256] of char ctype: SHUserName;
+type sh_password	= array[256] of char ctype: SHPassword;
+type sh_auth_form	= array[32] of char ctype: SHAuthForm;
+type sh_pm_values	= array[16] of int ctype: SHPMValues;
+type sh_zone		= array[128] of char ctype: SHZoneName;
+type sh_ntp_server	= array[256] of char ctype: SHNTPServer;
+type sh_full_name	= array[256] of char ctype: SHFullName;
+type sh_printer		= array[128] of char ctype: SHPrinterName;
+type sh_device_uri	= array[1024] of char ctype: SHDeviceURI;
+type sh_printer_text	= array[256] of char ctype: SHPrinterText;
+type sh_net_service	= array[64] of char ctype: SHNetServiceID;
+type sh_net_address	= array[64] of char ctype: SHNetAddress;
+type sh_net_list	= array[1024] of char ctype: SHNetList;
+type sh_computer_name	= array[256] of char ctype: SHComputerName;
+type sh_local_name	= array[64] of char ctype: SHLocalHostName;
+type sh_locale		= array[64] of char ctype: SHLocaleName;
+type sh_update_version	= array[64] of char ctype: SHUpdateVersion;
+type sh_update_text	= array[128] of char ctype: SHUpdateText;
+type sh_disk		= array[32] of char ctype: SHDiskName;
+
+/*
+ * 32000 sh_right_info — what `right` asks of this caller.
+ *   rule               an SH_RULE_* value
+ *   timeout            how long a credential lasts, in seconds
+ *   authorized         the caller's session may use the right now
+ *   seconds_left       how long that lasts (0 when not authorized)
+ *   console_user       the console user's name, for the panel's name field
+ *   user_is_admin      the console user is an administrator
+ *   user_has_password  the console user's account has a password; an
+ *                      admin without one is asked "Allow changes?" only
+ */
+routine sh_right_info(
+	server			: mach_port_t;
+	right			: sh_right;
+	out rule		: int;
+	out timeout		: int;
+	out authorized		: boolean_t;
+	out seconds_left	: int;
+	out console_user	: sh_user;
+	out user_is_admin	: boolean_t;
+	out user_has_password	: boolean_t;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32001 sh_authorize — prove `right` with a user's name and password,
+ * checked by PAM (service "authorization") and never kept. On success
+ * the caller's session holds a credential for the rule's timeout, so one
+ * unlock covers several changes, and seconds_left says for how long.
+ */
+routine sh_authorize(
+	server			: mach_port_t;
+	right			: sh_right;
+	user			: sh_user;
+	password		: sh_password;
+	out seconds_left	: int;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/* 32002 sh_deauthorize — forget the caller's session's credentials. */
+routine sh_deauthorize(
+	server			: mach_port_t;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32003 sh_set_pm_preferences — set one power source's Energy Saver
+ * settings (IOPMSetPMPreferences, which needs root); powerd follows
+ * kIOPMPrefsChangeNotify. Right: org.nextbsd.settings.energy.
+ * `source` is an SH_PM_SOURCE_*, `values` is indexed by SH_PM_*.
+ */
+routine sh_set_pm_preferences(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	source			: int;
+	values			: sh_pm_values;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32004 sh_set_time_zone — the system time zone, as tzsetup sets it:
+ * /usr/share/zoneinfo/<zone> copied to /etc/localtime and the name
+ * recorded in /var/db/zoneinfo. Then posts com.apple.system.timezone,
+ * on which processes reset their zone. Right: org.nextbsd.settings.datetime.
+ * `zone` is a name such as "America/Chicago".
+ */
+routine sh_set_time_zone(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	zone			: sh_zone;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32005 sh_set_date — set the clock (settimeofday, which also sets the
+ * hardware clock), then post com.apple.system.clock_set. Right:
+ * org.nextbsd.settings.datetime. `seconds` and `microseconds` are since
+ * the epoch, UTC.
+ */
+routine sh_set_date(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	seconds			: int64_t;
+	microseconds		: int;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32006 sh_set_network_time — keep the clock set from a time server:
+ * org.nextbsd.ntpd enabled and loaded (launchctl load -w) or unloaded
+ * and disabled (unload -w), as tzsetup does it. A non-empty `ntp_server`
+ * (a host name or address) replaces the servers in /etc/ntp.conf first,
+ * and a running ntpd is restarted to use it. Right:
+ * org.nextbsd.settings.datetime.
+ */
+routine sh_set_network_time(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	enabled			: boolean_t;
+	ntp_server		: sh_ntp_server;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * The Users & Login operations (nextbsd/nextbsd#639). Each works on the
+ * local directory, /Local/Library/DirectoryServices (libds), as
+ * adduser(8), rmuser(8) and passwd(1) do, and refuses on a machine
+ * joined to a directory server (SH_ERR_UNSUPPORTED): its accounts are
+ * the server's. Right: org.nextbsd.settings.users, except where said.
+ */
+
+/*
+ * 32007 sh_create_user — a new account, as adduser(8) makes one: the
+ * next free uid from 5001, a private group of the same name and id,
+ * the default shell, and its home in /Local/Users by createhomedir(8).
+ * `user` is the short name, `full_name` the realName. An empty
+ * `password` makes an account without one (noPassword). `admin` adds it
+ * to group admin. SH_ERR_EXISTS when the name or its group is taken.
+ */
+routine sh_create_user(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	user			: sh_user;
+	full_name		: sh_full_name;
+	password		: sh_password;
+	admin			: boolean_t;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32008 sh_delete_user — remove an account as rmuser(8) does: its
+ * processes, crontab and at jobs, its group memberships, its private
+ * group, the record, and unless `keep_home` its home. Refuses the
+ * console user (SH_ERR_LOGGED_IN) and the last administrator
+ * (SH_ERR_LAST_ADMIN). Automatic login of the account is turned off.
+ */
+routine sh_delete_user(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	user			: sh_user;
+	keep_home		: boolean_t;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32009 sh_set_password — set an account's password, hashed as
+ * passwd(1) hashes it; empty for none (noPassword). The console user
+ * may set their own with org.nextbsd.settings.users.own-password
+ * instead (authenticate-session-owner, good for one change): prove it
+ * with sh_authorize and the old password first.
+ */
+routine sh_set_password(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	user			: sh_user;
+	password		: sh_password;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32010 sh_set_admin — add an account to group admin, or take it out.
+ * Taking out the last administrator is refused (SH_ERR_LAST_ADMIN).
+ */
+routine sh_set_admin(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	user			: sh_user;
+	admin			: boolean_t;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32011 sh_set_auto_login — the account logged in automatically at
+ * startup: autoLoginUser in /Local/Library/Preferences/
+ * org.nextbsd.loginwindow.plist. An empty `user` turns automatic login
+ * off. Only an account without a password can be chosen, since
+ * automatic login never stands in for a password (autologin-user).
+ */
+routine sh_set_auto_login(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	user			: sh_user;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32012 sh_set_login_window_options — how the login window asks, in the
+ * same file: name and password fields, or a list of users (SHOWFULLNAME),
+ * and whether it shows Restart and Shut Down (RestartDisabled,
+ * ShutDownDisabled). They apply at the next login window.
+ */
+routine sh_set_login_window_options(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	show_name_fields	: boolean_t;
+	show_power_buttons	: boolean_t;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32013 sh_cups_admin — CUPSAdmin: add or remove a printer, a CUPS queue
+ * on the local cupsd (org.nextbsd.cupsd), with lpadmin(8) as root.
+ * Right: org.nextbsd.settings.printers.
+ *   SH_CUPS_ADD      a driverless (IPP Everywhere) queue named `printer`
+ *                    for `device_uri` (ipp, ipps or dnssd), described by
+ *                    `info` and `location`, enabled, accepting jobs and
+ *                    not shared
+ *   SH_CUPS_DELETE   the queue `printer`; the other arguments are empty
+ * The default printer isn't here: it's each user's own (lpoptions), and
+ * the app sets it without the helper.
+ */
+routine sh_cups_admin(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	op			: int;
+	printer			: sh_printer;
+	device_uri		: sh_device_uri;
+	info			: sh_printer_text;
+	location		: sh_printer_text;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32014 sh_commit_network_preferences — one network service's TCP/IP and
+ * DNS settings, written to SCPreferences (the service's IPv4, IPv6 and
+ * DNS entities), committed and applied as root, so that
+ * PreferencesMonitor flattens them into Setup: and ipconfigd configures
+ * the service again. Right: org.nextbsd.settings.network.
+ *
+ * Not a property list but the settings themselves, so the helper never
+ * writes anything but these keys of an existing service:
+ *   service_id       the service's ID in SCPreferences (a UUID)
+ *   ipv4_method      an SH_NET_V4_*; the address, mask and router are
+ *                    used by MANUAL (address and mask required) and the
+ *                    address by DHCP_MANUAL (INFORM); else empty
+ *   ipv6_method      an SH_NET_V6_*; the address (not link-local),
+ *                    prefix length and router are used by MANUAL
+ *   dns_servers      addresses, one per line (SH_NET_LIST_ENTRIES at
+ *                    most); empty: those DHCP gives
+ *   search_domains   domain names, one per line; empty: DHCP's
+ */
+routine sh_commit_network_preferences(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	service_id		: sh_net_service;
+	ipv4_method		: int;
+	ipv4_address		: sh_net_address;
+	ipv4_mask		: sh_net_address;
+	ipv4_router		: sh_net_address;
+	ipv6_method		: int;
+	ipv6_address		: sh_net_address;
+	ipv6_prefix		: int;
+	ipv6_router		: sh_net_address;
+	dns_servers		: sh_net_list;
+	search_domains		: sh_net_list;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32015 sh_set_computer_name — the computer's name, as scutil --set
+ * ComputerName and LocalHostName set them (SCPreferencesSetComputerName
+ * and SCPreferencesSetLocalHostName), committed and applied; hostnamed
+ * follows. Right: org.nextbsd.settings.network.
+ *   computer_name     what people see, UTF-8, no control characters
+ *   local_host_name   the Bonjour name before ".local": letters, digits
+ *                     and hyphens, at most 63
+ */
+routine sh_set_computer_name(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	computer_name		: sh_computer_name;
+	local_host_name		: sh_local_name;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32016 sh_set_system_locale — the system's language: `lang` (and
+ * `charset`, the locale's codeset) of /etc/login.conf's default class,
+ * then cap_mkdb. Accounts without a language of their own get it at
+ * their next login. Right: org.nextbsd.settings.locale. `locale` is a
+ * name from /usr/share/locale ("de_DE.UTF-8"), or "C" or "POSIX".
+ */
+routine sh_set_system_locale(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	locale			: sh_locale;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * The Update operations (Update.app, nextbsd/nextbsd#661): NextBSD
+ * updated as a whole with plain pkg update and pkg upgrade, which name
+ * no package: there is an update when pkg upgrade has something to do.
+ * None takes anything but the authorization: every pkg argument is the
+ * helper's own.
+ *
+ * Checking, downloading and installing take minutes, so each starts a
+ * job and returns at once (SH_ERR_BUSY while another runs); the app
+ * follows it with sh_update_status. One job runs at a time.
+ *
+ * Rights: org.nextbsd.settings.update (authenticate-admin) to install,
+ * org.nextbsd.settings.update.check (allow) to check, download and
+ * cancel. Status and the restart need only the console session: the
+ * install may replace SettingsRights.plist, and its approval covers the
+ * restart that finishes it.
+ */
+
+/*
+ * 32017 sh_update_status — the running job, or the last one.
+ *   job, state     an SH_UPDATE_JOB_* and an SH_UPDATE_* value
+ *   pending        a check found an update (pkg upgrade -n has
+ *                  something to do)
+ *   available      its version, for the title, from the repository's
+ *                  meta-package (NextBSD-desktop, NextBSD-server or
+ *                  NextBSD-everything); "" if none is found
+ *   size           a check's or download's bytes still to download
+ *   done, total    the job's progress: bytes while downloading, a
+ *                  thousand a package while installing
+ *   line           what the job is doing, for the progress bar
+ *   changed        a failed install had begun replacing packages
+ *   restart        an SH_UPDATE_RESTART_* value
+ *   restart_version  the version that update installed ("" if not
+ *                  known)
+ */
+routine sh_update_status(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	out job			: int;
+	out state		: int;
+	out pending		: boolean_t;
+	out available		: sh_update_version;
+	out size		: int64_t;
+	out done		: int64_t;
+	out total		: int64_t;
+	out line		: sh_update_text;
+	out changed		: boolean_t;
+	out restart		: int;
+	out restart_version	: sh_update_version;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32018 sh_update_check — refresh the catalogue (pkg update), then ask
+ * pkg upgrade -n whether there is anything to do and how much to
+ * download. Right: org.nextbsd.settings.update.check.
+ */
+routine sh_update_check(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32019 sh_update_download — fetch the update into pkg's cache (pkg
+ * upgrade -F), from the catalogue the check read. Nothing is installed.
+ * Right: org.nextbsd.settings.update.check.
+ */
+routine sh_update_download(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32020 sh_update_install — install the update over the running system
+ * (pkg upgrade), from the cache. Right: org.nextbsd.settings.update.
+ */
+routine sh_update_install(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32021 sh_update_cancel — stop a check or a download. An install can't
+ * be stopped. Right: org.nextbsd.settings.update.check.
+ */
+routine sh_update_cancel(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32022 sh_update_restart — restart the computer (shutdown -r now), only
+ * while an installed update waits for it (sh_update_status' restart is
+ * SH_UPDATE_RESTART_PENDING). No right: the install's approval covers
+ * it.
+ */
+routine sh_update_restart(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * Installed Versions (nextbsd/nextbsd#703): on a ZFS install each update
+ * is a boot environment named after its version. Update lists them
+ * itself (bectl list needs no privilege); these change them. `version`
+ * is a boot environment's name as bectl lists it. Right:
+ * org.nextbsd.settings.update. SH_ERR_UNSUPPORTED on a UFS install,
+ * SH_ERR_BUSY while an update job runs.
+ */
+
+/*
+ * 32023 sh_update_start_version — make `version` the one that starts
+ * (bectl activate), then restart into it. Not the running one
+ * (SH_ERR_INVALID).
+ */
+routine sh_update_start_version(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	version			: sh_update_version;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32024 sh_update_remove_version — remove `version` (bectl destroy -o).
+ * Not the running one or the one that starts next (SH_ERR_INVALID).
+ */
+routine sh_update_remove_version(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	version			: sh_update_version;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32025 sh_update_set_keep — how many versions named after their build
+ * an update keeps, 2 to 10 (bootenv-update's keep=).
+ */
+routine sh_update_set_keep(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	keep			: int;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/* 32026-32029: reserved for more update operations. */
+skip;	/* 32026 */
+skip;	/* 32027 */
+skip;	/* 32028 */
+skip;	/* 32029 */
+
+/*
+ * Installer.app's operations (nextbsd/nextbsd#670): NextBSD installed on
+ * a disk, which is erased, by the text installer's own engine,
+ * /usr/libexec/nextbsd-installer (probe-disks.sh and do-install.sh), run
+ * as root without a shell.
+ */
+
+/*
+ * 32030 sh_install_start — erase `disk` and install NextBSD on it, in the
+ * background: do-install.sh -d <disk>, with -c for SH_INSTALL_COPY.
+ * Right: org.nextbsd.installer (an administrator, every time). The helper
+ * checks the disk itself with probe-disks.sh first: one of the disks it
+ * lists, not the disk the running system started from, at least NEED
+ * bytes, and the mode the system's (SYSTEM: image or installed), else
+ * SH_ERR_INVALID. One install at a time (SH_ERR_BUSY).
+ */
+routine sh_install_start(
+	server			: mach_port_t;
+	auth			: sh_auth_form;
+	disk			: sh_disk;
+	mode			: int;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32031 sh_install_progress — how the install started from the caller's
+ * session is going: `state` an SH_INSTALL_* state, `percent` 0 to 100,
+ * `phase` an SH_INSTALL_* phase. No right; only that session (or root)
+ * may ask.
+ */
+routine sh_install_progress(
+	server			: mach_port_t;
+	out state		: int;
+	out percent		: int;
+	out phase		: int;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32032 sh_install_restart — restart the computer (shutdown -r now) once
+ * the caller's session's install is done, so it starts from the new disk
+ * if the firmware prefers it. No right beyond the install's own. After an
+ * install on a test disk (md) it restarts nothing.
+ */
+routine sh_install_restart(
+	server			: mach_port_t;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32033 sh_install_shutdown — turn the computer off (shutdown -p now) once
+ * the caller's session's install is done, as sh_install_restart restarts
+ * it: the installer's Shut Down, as nextbsd-installer has. After an
+ * install on a test disk (md) it turns nothing off.
+ */
+routine sh_install_shutdown(
+	server			: mach_port_t;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);
+
+/*
+ * 32034 sh_usb_grant — let the caller open one USB device: the one at
+ * `bus` and `address` (/dev/usb/<bus>.<address>.*), for Scanner.app
+ * (nextbsd/nextbsd#717), whose scanners SANE drives with libusb. Right:
+ * org.nextbsd.usb.device (an administrator, without a prompt). Only a
+ * device no kernel driver has: not a hub, and no interface with a driver
+ * attached (so never a disk, keyboard, mouse, sound or network device),
+ * else SH_ERR_INVALID. Its nodes become the caller's, mode 0600, until it
+ * is unplugged; nothing gives them back.
+ */
+routine sh_usb_grant(
+	server			: mach_port_t;
+	bus			: int;
+	address			: int;
+	out status		: int;
+	ServerAuditToken audit	: audit_token_t
+);

@@ -55,8 +55,16 @@ account only:
   It then appears as "Test scanner". A copy of `/usr/etc/sane.d/test.conf`
   beside it with `test-picture "Color pattern"` gives it something to show.
 
-USB scanners need the account at the screen to be allowed to open them:
-`usbconsoled` (nextbsd-userland) hands the console user the USB devices no
-kernel driver claims, as diskarbitrationd does disks.
+## USB scanners
+
+SANE opens USB scanners through libusb, on device nodes that are root's.
+When SANE lists no scanner and a USB device is connected that no kernel
+driver has and Scanner can't open (or `sane_open` is refused for one),
+Scanner asks SettingsHelper for that one device (`UsbGrant`, right
+`org.nextbsd.usb.device`: an administrator, without a prompt) and looks
+again. For anyone else, the window says an administrator needs to allow
+USB scanners. `Helper/` is the client: `Helper/mig/settingshelper.defs`
+and `settingshelper_types.h` are copies of nextbsd-userland's
+`src/SettingsHelper` ones, and the build makes the MIG stub from them.
 
 BSD 2-Clause; see [LICENSE](LICENSE).

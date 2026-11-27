@@ -813,7 +813,16 @@ SCSubmenu (NSMenu *main, NSString *title)
           [scanner openDevice:nil];
         }
     }
-  if (searched)
+  if (searched && [[info objectForKey:@"needsAdmin"] boolValue])
+    {
+      /* A USB device is there that Scanner may not open. */
+      [emptyPane setTitle:@"No scanner found"
+                     text:@"An administrator needs to allow USB scanners "
+                          @"before Scanner can use the USB device that is "
+                          @"connected. Scanner keeps looking."];
+      [[emptyPane button] setHidden:NO];
+    }
+  else if (searched)
     {
       [emptyPane setTitle:@"No scanner found"
                      text:@"Connect a scanner with USB and turn it on, or make "

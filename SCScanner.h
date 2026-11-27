@@ -62,7 +62,9 @@ extern NSString *const SCDPIKey;          /* NSNumber */
 extern NSString *const SCKindKey;         /* NSNumber SCKind */
 
 @protocol SCScannerDelegate
-/* The scanners now found; searched is NO until the first search ends. */
+/* The scanners now found; searched is NO until the first search ends;
+ * needsAdmin: a USB device Scanner may not open is connected, and the
+ * person isn't allowed to have it (not an administrator). */
 - (void)scannerDevicesChanged:(NSDictionary *)info;
 /* A device was opened (or failed to open): resolutions and the glass. */
 - (void)scannerOpened:(NSDictionary *)info;
@@ -83,6 +85,8 @@ extern NSString *const SCKindKey;         /* NSNumber SCKind */
   BOOL searched;
   BOOL initialised;
   NSDate *lastProgress;
+  NSMutableSet *usbAsked;   /* "bus.address" asked of SettingsHelper */
+  BOOL needsAdmin;
   /* Set from the main thread. */
   volatile BOOL cancelRequested;
 }
